@@ -1,1 +1,1 @@
-gunicorn mainn.wsgi
+gunicorn main.wsgi
