@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, redirect, url_for, send_file, flash, has_request_context, jsonify
+from flask import Flask, request, render_template_string, redirect, url_for, send_file, flash, has_request_context, jsonify, session, make_response, g
 import os, sys, platform, json, uuid, hashlib, re, pandas as pd, subprocess, io, base64, socket, requests, copy
 from datetime import datetime, date, timedelta
 from werkzeug.utils import secure_filename
@@ -10,51 +10,95 @@ import PyPDF2
 from PIL import Image, ImageDraw
 from reportlab.pdfgen import canvas
 from reportlab.lib.enums import TA_JUSTIFY
+import webbrowser
+from flask import has_request_context
 
-# -----------------------------------------------------------------------------
-# Configuration du chemin de stockage personnalisé
-# -----------------------------------------------------------------------------
-# Ce fichier de configuration stocke le chemin choisi par l'utilisateur.
-STORAGE_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage_config.json")
-try:
-    with open(STORAGE_CONFIG_FILE, "r", encoding="utf-8") as f:
-        storage_config = json.load(f)
-        CUSTOM_STORAGE_PATH = storage_config.get("storage_path")
-except Exception:
-    CUSTOM_STORAGE_PATH = None
+# -------------------------------------------------------------------------------
+# GOOGLE DRIVE MODULE
+# -------------------------------------------------------------------------------
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
-if CUSTOM_STORAGE_PATH and os.path.isdir(CUSTOM_STORAGE_PATH):
-    BASE_DIR = CUSTOM_STORAGE_PATH
-else:
-    BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MEDICSAS_FILES")
-os.makedirs(BASE_DIR, exist_ok=True)
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# -----------------------------------------------------------------------------
-# Création des sous-dossiers dans BASE_DIR
-# -----------------------------------------------------------------------------
-EXCEL_FOLDER = os.path.join(BASE_DIR, "Excel")
-os.makedirs(EXCEL_FOLDER, exist_ok=True)
-PDF_FOLDER = os.path.join(BASE_DIR, "PDF")
-os.makedirs(PDF_FOLDER, exist_ok=True)
-CONFIG_FOLDER = os.path.join(BASE_DIR, "Config")
-os.makedirs(CONFIG_FOLDER, exist_ok=True)
-BACKGROUND_FOLDER = os.path.join(BASE_DIR, "Background")
-os.makedirs(BACKGROUND_FOLDER, exist_ok=True)
+def get_drive_service():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    service = build('drive', 'v3', credentials=creds)
+    return service
 
-CONFIG_FILE = os.path.join(CONFIG_FOLDER, "config.json")
-EXCEL_FILE_PATH = os.path.join(EXCEL_FOLDER, "ConsultationData.xlsx")
+def upload_file_to_drive(file_path, mime_type='application/octet-stream', folder_id=None):
+    service = get_drive_service()
+    file_metadata = {'name': os.path.basename(file_path)}
+    if folder_id:
+        file_metadata['parents'] = [folder_id]
+    media = MediaFileUpload(file_path, mimetype=mime_type)
+    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    print(f"Fichier {file_path} uploadé avec l'ID {file.get('id')}")
+    return file.get('id')
 
-# -----------------------------------------------------------------------------
-# Adresse IP locale
-# -----------------------------------------------------------------------------
-LOCAL_IP = socket.gethostbyname(socket.gethostname())
-
+# -------------------------------------------------------------------------------
+# Application Flask et configuration générale
+# -------------------------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = 'votre_cle_secrete'
 
-# -----------------------------------------------------------------------------
-# Fonction de fusion d'arrière-plan PDF
-# -----------------------------------------------------------------------------
+# Adresse IP locale
+LOCAL_IP = socket.gethostbyname(socket.gethostname())
+
+# -------------------------------------------------------------------------------
+# Gestion du stockage individuel par utilisateur
+# -------------------------------------------------------------------------------
+def get_unique_user_id():
+    if not has_request_context():
+        # Vous pouvez retourner une valeur par défaut ou lever une exception
+        return "default_user_id"
+    if 'unique_user_id' not in session:
+        session['unique_user_id'] = str(uuid.uuid4())
+    return session['unique_user_id']
+
+def init_user_storage():
+    # Détermine le chemin de stockage global (modifiable via la variable d'environnement)
+    GLOBAL_STORAGE_PATH = os.environ.get("GLOBAL_STORAGE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "MEDICSAS_FILES"))
+    user_id = get_unique_user_id()
+    user_dir = os.path.join(GLOBAL_STORAGE_PATH, f"user_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+    folders = {
+        "Excel": os.path.join(user_dir, "Excel"),
+        "PDF": os.path.join(user_dir, "PDF"),
+        "Config": os.path.join(user_dir, "Config"),
+        "Background": os.path.join(user_dir, "Background")
+    }
+    for folder in folders.values():
+        os.makedirs(folder, exist_ok=True)
+    return folders
+
+@app.before_request
+def set_user_storage():
+    # Initialise les dossiers individuels et stocke les chemins dans g
+    folders = init_user_storage()
+    g.EXCEL_FOLDER = folders["Excel"]
+    g.PDF_FOLDER = folders["PDF"]
+    g.CONFIG_FOLDER = folders["Config"]
+    g.BACKGROUND_FOLDER = folders["Background"]
+    g.CONFIG_FILE = os.path.join(g.CONFIG_FOLDER, "config.json")
+    g.EXCEL_FILE_PATH = os.path.join(g.EXCEL_FOLDER, "ConsultationData.xlsx")
+
+# -------------------------------------------------------------------------------
+# Fonctions utilitaires et de fusion de PDF
+# -------------------------------------------------------------------------------
 def merge_with_background_pdf(generated_pdf_path):
     try:
         if background_file and os.path.exists(background_file):
@@ -79,16 +123,12 @@ def merge_with_background_pdf(generated_pdf_path):
     except Exception as e:
         print(f"Erreur lors de la fusion des PDFs : {str(e)}")
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # Activation et Gestion des Licences
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 SECRET_SALT = "S2!eUrltaMnSecet25lrao"
 
-def get_hardware_id():
-    hardware_id = str(uuid.getnode())
-    return hashlib.sha256(hardware_id.encode()).hexdigest()[:16]
-
-def generate_activation_key_for_user(user_hardware_id, plan):
+def generate_activation_key_for_user(user_unique_id, plan):
     now = datetime.now()
     if plan == "1 mois":
         plan_data = plan + now.strftime("%d%m%Y")
@@ -96,7 +136,7 @@ def generate_activation_key_for_user(user_hardware_id, plan):
         plan_data = plan + now.strftime("%m%Y")
     else:
         plan_data = plan
-    return hashlib.sha256((user_hardware_id + SECRET_SALT + plan_data).encode()).hexdigest()[:15]
+    return hashlib.sha256((user_unique_id + SECRET_SALT + plan_data).encode()).hexdigest()[:15]
 
 if platform.system() == "Windows":
     ACTIVATION_DIR = os.path.join(os.environ.get('APPDATA'), 'SystemData')
@@ -126,14 +166,14 @@ def check_activation():
         if plan == "essai_7jours":
             return date.today() <= activation_date + timedelta(days=7)
         elif plan == "1 mois":
-            expected = generate_activation_key_for_user(get_hardware_id(), plan)
+            expected = generate_activation_key_for_user(get_unique_user_id(), plan)
             if data.get("activation_code") == expected:
                 expiration_date = activation_date + timedelta(days=30)
                 return date.today() <= expiration_date
             else:
                 return False
         elif plan == "1 an":
-            expected = generate_activation_key_for_user(get_hardware_id(), plan)
+            expected = generate_activation_key_for_user(get_unique_user_id(), plan)
             if data.get("activation_code") == expected:
                 try:
                     expiration_date = activation_date.replace(year=activation_date.year + 1)
@@ -149,7 +189,7 @@ def update_activation_after_payment(plan):
     data = {
         "plan": plan,
         "activation_date": date.today().isoformat(),
-        "activation_code": generate_activation_key_for_user(get_hardware_id(), plan)
+        "activation_code": generate_activation_key_for_user(get_unique_user_id(), plan)
     }
     with open(ACTIVATION_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f)
@@ -254,9 +294,9 @@ def trial_expired():
     </html>
     """, local_ip=LOCAL_IP)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # Partie PayPal et Achat de Plans en mode Live
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID") or "AYPizBBNq1vp8WyvzvTHITGq9KoUUTXmzE0DBA7D_lWl5Ir6wEwVCB-gorvd1jgyX35ZqyURK6SMvps5"
 PAYPAL_SECRET = os.environ.get("PAYPAL_SECRET") or "EKSvwa_yK7ZYTuq45VP60dbRMzChbrko90EnhQsRzrMNZhqU2mHLti4_UTYV60ytY9uVZiAg7BoBlNno"
 
@@ -361,9 +401,9 @@ def paypal_cancel():
     flash("Paiement annulé par l'utilisateur.", "error")
     return redirect(url_for("index"))
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # Nouvelle Page d'Activation mise à jour
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 activation_template = """
 <!DOCTYPE html>
 <html lang="fr">
@@ -378,7 +418,7 @@ activation_template = """
       copyText.select();
       copyText.setSelectionRange(0, 99999);
       document.execCommand("copy");
-      alert("ID de la machine copié : " + copyText.value);
+      alert("ID de l'utilisateur copié : " + copyText.value);
     }
   </script>
 </head>
@@ -399,7 +439,7 @@ activation_template = """
       <div class="col-12 col-md-8 col-lg-6">
         <div class="card">
           <div class="card-body">
-            <p><strong>ID de la machine :</strong></p>
+            <p><strong>ID de l'utilisateur :</strong></p>
             <div class="input-group mb-3">
               <input type="text" class="form-control" id="machineID" value="{{ machine_id }}" readonly>
               <button class="btn btn-outline-secondary" type="button" onclick="copyMachineID()">Copier</button>
@@ -435,7 +475,7 @@ activation_template = """
 """
 @app.route("/activation", methods=["GET", "POST"])
 def activation():
-    machine_id = get_hardware_id()
+    machine_id = get_unique_user_id()
     if request.method == "POST":
         choix = request.form.get("choix")
         activation_code = request.form.get("activation_code", "").strip()
@@ -450,7 +490,7 @@ def activation():
             return redirect(url_for("index"))
         elif choix in ["1 an", "1 mois"]:
             if activation_code:
-                expected_code = generate_activation_key_for_user(get_hardware_id(), choix)
+                expected_code = generate_activation_key_for_user(get_unique_user_id(), choix)
                 if activation_code == expected_code:
                     update_activation_after_payment(choix)
                     flash(f"Plan {choix} activé avec succès via code.", "success")
@@ -467,19 +507,19 @@ def activation():
                     flash(f"Erreur lors de la création de la commande PayPal: {e}", "error")
     return render_template_string(activation_template, machine_id=machine_id)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # Données et Fonctions Utilitaires (Consultations, PDF, etc.)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 def load_config():
     try:
-        with open(CONFIG_FILE, 'r', encoding="utf-8") as f:
+        with open(g.CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
     except FileNotFoundError:
         config = {}
     return config
 
 def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding="utf-8") as f:
+    with open(g.CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f)
 
 def extract_rest_duration(text):
@@ -577,8 +617,8 @@ def load_patient_data():
     global patient_name_to_age, patient_id_to_age, patient_name_to_phone, patient_id_to_phone
     global patient_name_to_antecedents, patient_id_to_antecedents
     global patient_name_to_dob, patient_id_to_dob, patient_name_to_gender, patient_id_to_gender
-    if os.path.exists(EXCEL_FILE_PATH):
-        df_patients = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+    if os.path.exists(g.EXCEL_FILE_PATH):
+        df_patients = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
         required_columns = {'patient_id', 'patient_name', 'age', 'patient_phone', 'antecedents', 'date_of_birth', 'gender'}
         if required_columns.issubset(set(df_patients.columns)):
             df_patients['patient_id'] = df_patients['patient_id'].astype(str)
@@ -620,13 +660,11 @@ def load_patient_data():
         patient_name_to_gender.clear()
         patient_id_to_gender.clear()
 
-load_patient_data()
-
 @app.route("/get_last_consultation")
 def get_last_consultation():
     patient_id = request.args.get("patient_id", "").strip()
-    if patient_id and os.path.exists(EXCEL_FILE_PATH):
-        df = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+    if patient_id and os.path.exists(g.EXCEL_FILE_PATH):
+        df = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
         df = df[df['patient_id'].astype(str) == patient_id]
         if not df.empty:
             last_row = df.iloc[-1].to_dict()
@@ -636,8 +674,8 @@ def get_last_consultation():
 @app.route("/get_consultations")
 def get_consultations():
     patient_id = request.args.get("patient_id", "").strip()
-    if patient_id and os.path.exists(EXCEL_FILE_PATH):
-        df = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+    if patient_id and os.path.exists(g.EXCEL_FILE_PATH):
+        df = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
         df = df[df['patient_id'].astype(str) == patient_id]
         return df.to_json(orient="records")
     return "[]"
@@ -647,9 +685,14 @@ def delete_consultation():
     consultation_id = request.form.get("consultation_id", "").strip()
     if consultation_id:
         try:
-            df = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+            df = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
             df = df[df["consultation_id"] != consultation_id]
-            df.to_excel(EXCEL_FILE_PATH, index=False)
+            df.to_excel(g.EXCEL_FILE_PATH, index=False)
+            # Synchronisation sur Google Drive
+            try:
+                upload_file_to_drive(g.EXCEL_FILE_PATH, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            except Exception as e:
+                print(f"Erreur lors de l'upload sur Drive: {e}")
             return "OK", 200
         except Exception as e:
             return str(e), 500
@@ -935,8 +978,17 @@ def index():
         if not patient_id:
             return render_template_string(alert_template, alert_type="warning", alert_title="Attention", alert_text="Veuillez entrer l'ID du patient.", redirect_url=url_for("index"))
 
-        if os.path.exists(EXCEL_FILE_PATH):
-            df = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+        # Vérification de l'unicité de l'ID pour un même patient
+        if os.path.exists(g.EXCEL_FILE_PATH):
+            df_existing = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
+            if patient_id in df_existing["patient_id"].astype(str).tolist():
+                existing_name = df_existing.loc[df_existing["patient_id"].astype(str) == patient_id, "patient_name"].iloc[0]
+                if existing_name.strip().lower() != patient_name.strip().lower():
+                    flash("L'ID existe déjà et est associé à un autre patient.", "error")
+                    return render_template_string(alert_template, alert_type="error", alert_title="Erreur", alert_text="L'ID existe déjà et est associé à un autre patient.", redirect_url=url_for("index"))
+
+        if os.path.exists(g.EXCEL_FILE_PATH):
+            df = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
         else:
             df = pd.DataFrame(columns=[
                 "consultation_date", "patient_id", "patient_name", "date_of_birth", "gender", "age", "patient_phone", "antecedents",
@@ -969,7 +1021,12 @@ def index():
             "consultation_id": str(uuid.uuid4())
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        df.to_excel(EXCEL_FILE_PATH, index=False)
+        df.to_excel(g.EXCEL_FILE_PATH, index=False)
+        # Synchronisation sur Google Drive après mise à jour du fichier Excel
+        try:
+            upload_file_to_drive(g.EXCEL_FILE_PATH, mime_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        except Exception as e:
+            print(f"Erreur lors de la synchronisation sur Drive: {e}")
         load_patient_data()
         flash("Les données du patient ont été enregistrées avec succès.", "success")
     patient_data = {}
@@ -992,7 +1049,7 @@ def index():
                                   default_certificate_text=default_certificate_text,
                                   patient_ids=patient_ids,
                                   patient_names=patient_names,
-                                  host_address=request.host_url,
+                                  host_address=f"http://{LOCAL_IP}:3000",
                                   patient_data=patient_data,
                                   saved_medications=saved_medications,
                                   saved_analyses=saved_analyses,
@@ -1020,8 +1077,13 @@ def generate_pdf_route():
     analyses_list = request.args.get("analyses_list", "").split("\n") or ["Analyse Exemple"]
     radiologies_list = request.args.get("radiologies_list", "").split("\n") or ["Radiologie Exemple"]
 
-    pdf_path = os.path.join(PDF_FOLDER, f"Ordonnance_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf")
+    pdf_path = os.path.join(g.PDF_FOLDER, f"Ordonnance_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf")
     generate_pdf_file(pdf_path, form_data, medication_list, analyses_list, radiologies_list)
+    # Optionnel : synchroniser le PDF sur Google Drive
+    try:
+        upload_file_to_drive(pdf_path, mime_type='application/pdf')
+    except Exception as e:
+        print(f"Erreur lors de l'upload du PDF sur Drive: {e}")
     return send_file(pdf_path, as_attachment=True)
 
 def add_background_platypus(canvas_obj, doc):
@@ -1162,10 +1224,10 @@ def generate_history_pdf_file(pdf_path, df_filtered):
 def generate_history_pdf():
     patient_id_filter = request.args.get("patient_id_filter", "").strip()
     patient_name_filter = request.args.get("patient_name_filter", "").strip()
-    if not os.path.exists(EXCEL_FILE_PATH):
+    if not os.path.exists(g.EXCEL_FILE_PATH):
         flash("Aucune donnée de consultation n'a été trouvée.", "warning")
         return redirect(url_for("index"))
-    df = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+    df = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
     if patient_id_filter:
         df_filtered = df[df['patient_id'].astype(str) == patient_id_filter]
     elif patient_name_filter:
@@ -1176,8 +1238,12 @@ def generate_history_pdf():
     if df_filtered.empty:
         flash("Aucune consultation trouvée pour ce patient.", "info")
         return redirect(url_for("index"))
-    pdf_path = os.path.join(PDF_FOLDER, f"Historique_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf")
+    pdf_path = os.path.join(g.PDF_FOLDER, f"Historique_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf")
     generate_history_pdf_file(pdf_path, df_filtered)
+    try:
+        upload_file_to_drive(pdf_path, mime_type='application/pdf')
+    except Exception as e:
+        print(f"Erreur lors de l'upload du PDF historique sur Drive: {e}")
     return send_file(pdf_path, as_attachment=True)
 
 # --- Modification pour les importations via AJAX ---
@@ -1189,7 +1255,7 @@ def import_excel():
     if file.filename == "":
         return jsonify({"status": "warning", "message": "Aucun fichier sélectionné."})
     filename = secure_filename(file.filename)
-    file_path = os.path.join(EXCEL_FOLDER, filename)
+    file_path = os.path.join(g.EXCEL_FOLDER, filename)
     file.save(file_path)
     try:
         df = pd.read_excel(file_path)
@@ -1239,7 +1305,7 @@ def import_background():
     if file.filename == "":
         return jsonify({"status": "warning", "message": "Aucun fichier sélectionné."})
     filename = secure_filename(file.filename)
-    file_path = os.path.join(BACKGROUND_FOLDER, filename)
+    file_path = os.path.join(g.BACKGROUND_FOLDER, filename)
     file.save(file_path)
     if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
         bg_type = 'image'
@@ -1264,10 +1330,10 @@ def update_comment():
     if not patient_id:
          flash("Veuillez entrer l'ID du patient.", "warning")
          return redirect(url_for("index"))
-    if os.path.exists(EXCEL_FILE_PATH):
-         df = pd.read_excel(EXCEL_FILE_PATH, sheet_name=0)
+    if os.path.exists(g.EXCEL_FILE_PATH):
+         df = pd.read_excel(g.EXCEL_FILE_PATH, sheet_name=0)
          df.loc[df['patient_id'].astype(str)==patient_id, 'doctor_comment'] = new_comment
-         df.to_excel(EXCEL_FILE_PATH, index=False)
+         df.to_excel(g.EXCEL_FILE_PATH, index=False)
          flash("Commentaire mis à jour.", "success")
     else:
          flash("Fichier de données non trouvé.", "error")
@@ -1285,30 +1351,12 @@ def settings():
         current_config['location'] = request.form.get("lieu", "")
         current_config['theme'] = request.form.get("theme", current_config.get("theme", "Default"))
         current_config['background_file_path'] = request.form.get("arriere_plan", "")
-        # Nouveau champ pour le chemin de stockage personnalisé
+        # Nouveau champ pour le chemin de stockage personnalisé (pour le stockage global, non individualisé)
         storage_path = request.form.get("storage_path", "").strip()
         if storage_path:
             current_config['storage_path'] = storage_path
-            # Mise à jour globale du chemin de stockage et des dossiers associés
-            global BASE_DIR, EXCEL_FOLDER, PDF_FOLDER, CONFIG_FOLDER, BACKGROUND_FOLDER, CONFIG_FILE, EXCEL_FILE_PATH
-            BASE_DIR = storage_path
-            os.makedirs(BASE_DIR, exist_ok=True)
-            EXCEL_FOLDER = os.path.join(BASE_DIR, "Excel")
-            os.makedirs(EXCEL_FOLDER, exist_ok=True)
-            PDF_FOLDER = os.path.join(BASE_DIR, "PDF")
-            os.makedirs(PDF_FOLDER, exist_ok=True)
-            CONFIG_FOLDER = os.path.join(BASE_DIR, "Config")
-            os.makedirs(CONFIG_FOLDER, exist_ok=True)
-            BACKGROUND_FOLDER = os.path.join(BASE_DIR, "Background")
-            os.makedirs(BACKGROUND_FOLDER, exist_ok=True)
-            CONFIG_FILE = os.path.join(CONFIG_FOLDER, "config.json")
-            EXCEL_FILE_PATH = os.path.join(EXCEL_FOLDER, "ConsultationData.xlsx")
-            # Sauvegarde dans le fichier de configuration de stockage
-            try:
-                with open(STORAGE_CONFIG_FILE, "w", encoding="utf-8") as f:
-                    json.dump({"storage_path": storage_path}, f)
-            except Exception as e:
-                flash(f"Erreur lors de la sauvegarde du chemin de stockage : {str(e)}", "error")
+            # Mise à jour du chemin global de stockage
+            os.makedirs(storage_path, exist_ok=True)
         meds = request.form.get("liste_medicaments", "")
         current_config['medications_options'] = meds.splitlines() if meds else default_medications_options
         analyses = request.form.get("liste_analyses", "")
@@ -1321,9 +1369,9 @@ def settings():
     else:
         return render_template_string(settings_template, config=current_config)
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 # Templates HTML
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 main_template = """
 <!DOCTYPE html>
 <html lang="fr">
@@ -2143,7 +2191,7 @@ main_template = """
       </form>
     </div>
     <div class="card-footer text-center footer" style="color: #343a40;">
-    SASTOUKA DIGITAL © 2024 sastoukadigital@gmail.com • Whatsapp +212652084735<br>
+    SASTOUKA DIGITAL © 2025 sastoukadigital@gmail.com • Whatsapp +212652084735<br>
     Accès via réseau local : <span>{{ host_address }}</span>
     </div>
   </div>
@@ -2235,7 +2283,7 @@ admin_template = """
   <h2 class="text-center font-bold text-2xl">Générateur de Clés d'Activation</h2>
   <form method="POST">
     <div class="mb-3">
-      <label class="form-label">ID Unique du Matériel:</label>
+      <label class="form-label">ID Unique de l'utilisateur:</label>
       <input type="text" class="form-control" name="hardware_id" value="{{ hardware_id }}" readonly>
     </div>
     <div class="mb-3">
@@ -2321,6 +2369,15 @@ settings_template = """
 """
 
 if __name__ == "__main__":
-    import webbrowser
+    with app.test_request_context():
+        folders = init_user_storage()
+        g.EXCEL_FOLDER = folders["Excel"]
+        g.PDF_FOLDER = folders["PDF"]
+        g.CONFIG_FOLDER = folders["Config"]
+        g.BACKGROUND_FOLDER = folders["Background"]
+        g.CONFIG_FILE = os.path.join(g.CONFIG_FOLDER, "config.json")
+        g.EXCEL_FILE_PATH = os.path.join(g.EXCEL_FOLDER, "ConsultationData.xlsx")
+        load_patient_data()
+    # Ouvre automatiquement l'application dans le navigateur
     webbrowser.open("http://127.0.0.1:3000")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
